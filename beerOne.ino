@@ -8,7 +8,6 @@
 #include <Wire.h>
 #include <Adafruit_ILI9341.h>
 #include <Adafruit_STMPE610.h>
-#include <ESP8266WiFi.h>
 
 #include <Control.h>
 #include <MsTimer2.h>
@@ -31,7 +30,6 @@ void Log(char *buf);
 *********************************************/
 #define PIN_LM35GND 28 //このピンから電源GNDを取っているだけ
 #define PIN_LM35TEMP 15 //Analog15
-#define LM35_OFFSET 35 //AD値からこの値を引くと摂氏
 #define ENABLE_LM35
 
 /********************************************
@@ -40,8 +38,8 @@ void Log(char *buf);
 #include <DHT.h>
 
 
-#define DHTPIN 26     // what digital pin we're connected to
-#define PIN_DHTGND 27 //このピンから電源GNDを取っているだけ
+#define DHTPIN 29     // what digital pin we're connected to
+#define PIN_DHTGND 28 //このピンから電源GNDを取っているだけ
 #define DHTTYPE DHT22   // DHT 22  (AM2302), AM2321
 
 // Connect pin 1 (on the left) of the sensor to +5V
@@ -50,10 +48,7 @@ void Log(char *buf);
 // Connect pin 2 of the sensor to whatever your DHTPIN is
 // Connect pin 4 (on the right) of the sensor to GROUND
 // Connect a 10K resistor from pin 2 (data) to pin 1 (power) of the sensor
-//#define ENABLE_DHT
-#ifdef ENABLE_DHT
-DHT dht(DHTPIN, DHTTYPE);// Initialize DHT sensor.
-#endif //ENABLE_DHT
+#define ENABLE_DHT
 
 /********************************************
   信号
@@ -70,7 +65,10 @@ class TBeerOne {
   public:
   long msec,last_msec,last_dht_msec,last_eval_msec; 
   bool isTemp;
-  float Temperature,Humidity;
+  int Temperature,Humidity;
+#ifdef ENABLE_DHT
+  DHT *dht;// Initialize DHT sensor.
+#endif //ENABLE_DHT
   long last_ch_msec; //前回クーラーヒータ駆動変化時間
   long last_cooloff_msec; //前回クーラー駆動OFF時間記録
   long SignalStartMSEC; //以下のSignals[0]の記録時刻
@@ -184,11 +182,11 @@ void TBeerOne::DrawGraph()
   GraphTemp->Draw(); //基本矩形部の描画
   for(int t=10;t<100;t+=10) { //Y軸温度１０度毎スケール描画
     gcm->tft->drawLine(GetX(0),GetY(t),GetX(2),GetY(t),ILI9341_DARKGREY);
-    if( t==30 ) {
+    if( (t==10)||(t==30)||(t==60) ) {
       gcm->tft->setCursor(GetX(-14) , GetY(t+4));
       gcm->tft->setTextColor(GraphTemp->FontColor);
       gcm->tft->setTextSize(1);
-      gcm->tft->println("30");
+      sprintf(nlog,"%d",t); gcm->tft->println(nlog);
 
     }
   }
@@ -206,7 +204,7 @@ void TBeerOne::DrawGraphScaleX(int color) //X軸スケール描画
   sprintf(nlog,"ip%d x_count%d SignalStartMSEC%ld\n",IntervalPixel,x_count,SignalStartMSEC); Log(nlog);
   for(int x=40;x<GraphWidthX();x+=SCALE_INTERVAL_X) { //X軸スケール描画
       gcm->tft->drawLine(GetX(x),GetY(0),GetX(x),GetY(-3),ILI9341_DARKGREY); //縦引き出し線
-      int xsec=SignalStartMSEC/1000+(GraphStart+IntervalPixel*x)*(SignalIntervalMSEC/1000); //x位置の時刻算出
+      long xsec=SignalStartMSEC/1000L+(GraphStart+IntervalPixel*(long)x)*(SignalIntervalMSEC/1000); //x位置の時刻算出
       int sec=xsec%60;
       int xmin=xsec/60;
       int m=xmin%60;
@@ -226,26 +224,24 @@ void TBeerOne::DrawGraphScaleX(int color) //X軸スケール描画
       sprintf(nlog,"%d/%02d:%02d",xday,hour,m); gcm->tft->println(nlog);
   }
 }
+
 void TBeerOne::DrawGraphLines(int color)
 { TSignal *sig; 
   int x_count=GraphWidthX(); //X方向描画ポイント可能数
-  int IntervalPixel=GetIntervalPixel();
-  int x_max=(SignalCount-GraphStart)/IntervalPixel;
-  if( x_max<x_count ) x_count=x_max; //描画ポイント数を存在するデータ数から補正
+  int IntervalPixel=GetIntervalPixel(); //間引き間隔
   
   for(int k=0;k<x_count;k++) {
-    sig=&Signals[GraphStart+k*IntervalPixel];
-    float ref;
-    if( (1<=k)&&(k<x_count-1) ) { //前後に値があれば３点で平均補間する
-      ref=sig->Ref+Signals[GraphStart+(k-1)*IntervalPixel].Ref+Signals[GraphStart+(k+1)*IntervalPixel].Ref;
-      ref=ref/3;
-    } else {
+    int i=GraphStart+k*IntervalPixel;
+    if( SignalCount<=i ) break;
+    sig=&Signals[i];
+    float ref,tt,hh;
       ref=sig->Ref;
-    }
-    gcm->tft->drawPixel(GetX(2+k),GetY(ref),color);
-    
+      tt=sig->Temp;
+      hh=sig->Hum;
+    gcm->tft->drawPixel(GetX(2+k),GetY(tt),ILI9341_RED);
+    gcm->tft->drawPixel(GetX(2+k),GetY(hh),ILI9341_CYAN);
+    gcm->tft->drawPixel(GetX(2+k)+1,GetY(ref),color);
   }
-  
 }
 /********************************************
   信号追加
@@ -294,6 +290,13 @@ TBeerOne::TBeerOne()
     digitalWrite(PERFAN_PIN,LOW);  pinMode(PERFAN_PIN, OUTPUT); //クーラーペルチェ側ファン駆動 ON:1 OFF:0
 #endif //ENABLE_COOLER
 
+#ifdef ENABLE_DHT
+  pinMode(PIN_DHTGND, OUTPUT); //このピンから電源GNDを取っているだけ
+  digitalWrite(PIN_DHTGND,LOW);
+  dht=new DHT(DHTPIN, DHTTYPE);// Initialize DHT sensor.
+  dht->begin(); //温度センサ開始
+#endif //ENABLE_DHT
+
 }
 void TBeerOne::Timer()
 {
@@ -315,20 +318,23 @@ void TBeerOne::Clock()
 #ifdef ENABLE_DHT
     if( isTemp ) { //それぞれ250ms潜るので交互に読み出す
       isTemp=false;
-      Temperature = dht.readTemperature(); // Read temperature as Celsius (the default)
-      sprintf(CurrentTempString,"%4.1f C",Temperature); //温湿度の表示更新
+      Temperature = dht->readTemperature(); // Read temperature as Celsius (the default)
+      sprintf(CurrentTemp->Text,"%d",Temperature); //温湿度の表示更新
       CurrentTemp->Draw();
     } else {
       isTemp=true;
-      Humidity= dht.readHumidity();
-      sprintf(RefHumString,"%4.1f \%",Humidity); //温湿度の表示更新
+      Humidity= dht->readHumidity();
+      sprintf(RefHum->Text,"%d",Humidity); //温湿度の表示更新
       RefHum->Draw();
     }
 #endif //ENABLE_DHT
 
 #ifdef ENABLE_LM35
     int last=RefTemp->Tag;
-    RefTemp->Tag=analogRead(PIN_LM35TEMP)-LM35_OFFSET; //AD値からこの値を引くと摂氏
+    // アナログ分解能10bit 5V/1024=0.0048V/LSB   LM35は10mV/℃だから分解能＝0.5℃
+    //28℃の時、28+30=58    0.0048Vx58=0.278V
+    //温度＝AD値*0.0048V *100=AD値*48/100
+    RefTemp->Tag=3+(analogRead(PIN_LM35TEMP)*48)/100; //AD値からこの値を引くと摂氏
     if( last!=RefTemp->Tag ) {
         sprintf(nlog,"temp %d\n",RefTemp->Tag); Log(nlog); 
     }
@@ -398,7 +404,7 @@ void TBeerOne::Clock()
     RefTemp->Draw();
     if( last_dht_msec+SignalIntervalMSEC<msec ) {
       last_dht_msec=msec;
-      AddSignal(0,0,RefTemp->Tag);
+      AddSignal(Temperature,Humidity,RefTemp->Tag);
     }
 #endif //ENABLE_LM35
   }
@@ -428,16 +434,7 @@ void setup(void)
 
   setupForm(); //画面初期化
   be.DrawGraph(); //画面グラフ部初期描画
-#ifdef ENABLE_DHT
-  pinMode(PIN_DHTGND, OUTPUT); //このピンから電源GNDを取っているだけ
-  digitalWrite(PIN_DHTGND,LOW);
-  dht.begin(); //温度センサ開始
-#endif //ENABLE_DHT
 
-#ifdef ENABLE_LM35
-    pinMode(PIN_LM35GND, OUTPUT);
-    digitalWrite(PIN_LM35GND,LOW);
-#endif //ENABLE_LM35
 
   MsTimer2::start();
 
